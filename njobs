@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""
+Display status of queued jobs and GPU claims.
+
+Usage:
+  njobs              Show pending/running/done jobs
+  njobs -a|--all     Show all job history
+  njobs --clean      Clean stale claims and old records
+  njobs --clear-done Clear done/failed jobs older than 24h
+"""
+
+import json
+import sys
+import argparse
+import subprocess
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
+
+STATE_DIR = Path.cwd() / ".gpu_queue"
+JOBS_DIR = STATE_DIR / "jobs"
+CLAIMS_DIR = STATE_DIR / "claims"
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def load_jobs() -> Dict[str, Dict]:
+    """Load all job records from JSON files."""
+    jobs = {}
+    if JOBS_DIR.exists():
+        for job_file in JOBS_DIR.glob("*.json"):
+            try:
+                job = json.loads(job_file.read_text())
+                jobs[job.get("job_id", "unknown")] = job
+            except Exception:
+                pass
+    return jobs
+
+
+def load_claims() -> Dict[int, Tuple[str, int]]:
+    """Load GPU claims, return dict of gpu_idx -> (job_id, pid)."""
+    claims = {}
+    if CLAIMS_DIR.exists():
+        for claim_dir in CLAIMS_DIR.glob("gpu_*.lock"):
+            try:
+                gpu_idx = int(claim_dir.name.split("_")[1])
+                job_id_file = claim_dir / "job_id"
+                pid_file = claim_dir / "pid"
+                if job_id_file.exists() and pid_file.exists():
+                    job_id = job_id_file.read_text().strip()
+                    pid = int(pid_file.read_text().strip())
+                    claims[gpu_idx] = (job_id, pid)
+            except Exception:
+                pass
+    return claims
+
+
+def format_time(iso_string: str) -> str:
+    """Convert ISO format to HH:MM:SS relative display."""
+    if not iso_string:
+        return "--"
+    try:
+        dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+        now = datetime.utcnow().replace(tzinfo=None)
+        delta = now - dt.replace(tzinfo=None)
+        if delta.total_seconds() < 3600:
+            return f"{int(delta.total_seconds() / 60)}m ago"
+        elif delta.total_seconds() < 86400:
+            hours = delta.total_seconds() / 3600
+            return f"{int(hours)}h ago"
+        else:
+            days = delta.total_seconds() / 86400
+            return f"{int(days)}d ago"
+    except Exception:
+        return iso_string[:10]
+
+
+def display_jobs(show_all: bool = False, include_done: bool = True):
+    """Display job table."""
+    jobs = load_jobs()
+    claims = load_claims()
+
+    if not jobs:
+        print("No jobs found.")
+        return
+
+    # Filter by status if not showing all
+    if not show_all:
+        jobs = {k: v for k, v in jobs.items() if v.get("status") != "done"}
+
+    # Sort by queued_at descending (newest first)
+    sorted_jobs = sorted(
+        jobs.items(),
+        key=lambda x: x[1].get("queued_at", ""),
+        reverse=True,
+    )
+
+    # Print header
+    print(
+        f"{'JOB ID':<12} {'TASK':<25} {'STATUS':<10} {'GPUs':<12} {'QUEUED':<12} {'LOG':<40}"
+    )
+    print("-" * 111)
+
+    # Print rows
+    for job_id, job in sorted_jobs:
+        task_name = Path(job.get("script_path", "unknown")).stem
+        status = job.get("status", "unknown")
+        queued_at = job.get("queued_at", "")
+        log_file = job.get("log_file", "")
+
+        # Find GPUs for this job
+        gpu_list = sorted([idx for idx, (jid, _) in claims.items() if jid == job_id])
+        gpu_str = ",".join(str(g) for g in gpu_list) if gpu_list else "--"
+
+        # Format log file path (show just the filename)
+        log_name = Path(log_file).name if log_file else "--"
+
+        print(
+            f"{job_id:<12} {task_name:<25} {status:<10} {gpu_str:<12} {format_time(queued_at):<12} {log_name:<40}"
+        )
+
+    print()
+
+
+def display_gpu_status():
+    """Display GPU status and claims."""
+    claims = load_claims()
+    jobs = load_jobs()
+
+    # Get total GPU count
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return
+
+        gpus_info = {}
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 4:
+                try:
+                    idx = int(parts[0])
+                    name = parts[1]
+                    used = float(parts[2])
+                    total = float(parts[3])
+                    gpus_info[idx] = (name, used, total)
+                except ValueError:
+                    pass
+
+        if not gpus_info:
+            return
+
+        print("GPU STATUS:")
+        for gpu_idx in sorted(gpus_info.keys()):
+            name, used, total = gpus_info[gpu_idx]
+            if gpu_idx in claims:
+                job_id, pid = claims[gpu_idx]
+                job = jobs.get(job_id, {})
+                task_name = Path(job.get("script_path", "unknown")).stem
+                claimed_at = job.get("started_at", "")
+                print(
+                    f"  GPU {gpu_idx}: CLAIMED by {job_id} ({task_name}) since {format_time(claimed_at)}"
+                )
+            else:
+                used_pct = (used / total * 100) if total > 0 else 0
+                print(f"  GPU {gpu_idx}: FREE ({used:.0f}/{total:.0f} MiB, {used_pct:.1f}% used)")
+    except Exception:
+        pass
+
+
+def cmd_clean():
+    """Clean stale claims."""
+    subprocess.run(
+        ["python3", str(SCRIPT_DIR / "gpu_claim.py"), "clean"],
+        cwd=Path.cwd(),
+        capture_output=True,
+    )
+    print("Cleaned stale claims.")
+
+
+def cmd_clear_done():
+    """Clear done/failed jobs."""
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    jobs = load_jobs()
+    count = 0
+    for job_id, job in jobs.items():
+        if job.get("status") in ("done", "failed"):
+            ended_at = job.get("ended_at")
+            if ended_at:
+                try:
+                    ended = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                    if ended < cutoff:
+                        job_file = JOBS_DIR / f"{job_id}.json"
+                        job_file.unlink()
+                        count += 1
+                except Exception:
+                    pass
+    print(f"Cleared {count} old job records.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Display job queue status.")
+    parser.add_argument(
+        "-a", "--all", action="store_true", help="Show all job history"
+    )
+    parser.add_argument("--clean", action="store_true", help="Clean stale claims")
+    parser.add_argument(
+        "--clear-done", action="store_true", help="Clear old done/failed jobs"
+    )
+
+    args = parser.parse_args()
+
+    if args.clean:
+        cmd_clean()
+        return 0
+
+    if args.clear_done:
+        cmd_clear_done()
+        return 0
+
+    display_jobs(show_all=args.all)
+    display_gpu_status()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
