@@ -4,6 +4,8 @@ set -euo pipefail
 
 script_path=$1
 shift
+hostname=$(hostname)
+slurm_job_id="${SLURM_JOB_ID:-}"
 
 # Optional: --pids <pid1,pid2,...>
 pids=""
@@ -46,12 +48,47 @@ log_file="$3"
 pids="$4"
 num_gpus="$5"
 script_dir="$6"
+hostname="$7"
+slurm_job_id="$8"
+
+finalized=0
+signal_status=""
+
+finalize_job() {
+    local status="$1"
+    local exit_code="$2"
+    if [[ "$finalized" -eq 1 ]]; then
+        return
+    fi
+    finalized=1
+    python3 "${script_dir}/gpu_claim.py" update-status \
+        --job-id "$job_id" --status "$status" --exit-code "$exit_code" \
+        --hostname "$hostname" --script-path "$script_path" \
+        --slurm-job-id "$slurm_job_id" 2>/dev/null || true
+}
 
 # Function to run cleanup on exit
 cleanup() {
+    local rc=$?
+    if [[ "$finalized" -eq 0 ]]; then
+        if [[ -n "$signal_status" ]]; then
+            finalize_job "$signal_status" "$rc"
+        elif [[ $rc -eq 0 ]]; then
+            finalize_job "done" 0
+        else
+            finalize_job "failed" "$rc"
+        fi
+    fi
     python3 "${script_dir}/gpu_claim.py" release --job-id "$job_id" 2>/dev/null || true
 }
+
+handle_signal() {
+    signal_status="interrupted"
+    exit 128
+}
+
 trap cleanup EXIT
+trap handle_signal INT TERM HUP
 
 # Wait for prerequisite PIDs if given
 if [[ -n "$pids" ]]; then
@@ -74,7 +111,9 @@ if [[ $num_gpus -gt 0 ]]; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Claimed GPUs: $claimed" >> "$log_file"
             export CUDA_VISIBLE_DEVICES="$claimed"
             python3 "${script_dir}/gpu_claim.py" update-status \
-                --job-id "$job_id" --status running --pid $$ --gpus "$claimed" 2>/dev/null || true
+                --job-id "$job_id" --status running --pid $$ --gpus "$claimed" \
+                --hostname "$hostname" --script-path "$script_path" \
+                --slurm-job-id "$slurm_job_id" 2>/dev/null || true
             break
         fi
         python3 "${script_dir}/gpu_claim.py" clean 2>/dev/null || true
@@ -84,21 +123,23 @@ if [[ $num_gpus -gt 0 ]]; then
 else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] No GPU waiting required (NUM_GPUS=0)" >> "$log_file"
     python3 "${script_dir}/gpu_claim.py" update-status \
-        --job-id "$job_id" --status running --pid $$ 2>/dev/null || true
+        --job-id "$job_id" --status running --pid $$ \
+        --hostname "$hostname" --script-path "$script_path" \
+        --slurm-job-id "$slurm_job_id" 2>/dev/null || true
 fi
 
 # Run the actual training/eval script
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting: bash $script_path" >> "$log_file"
+set +e
 bash "$script_path"
 exit_code=$?
+set -e
 
 # Update final status
 if [[ $exit_code -eq 0 ]]; then
-    python3 "${script_dir}/gpu_claim.py" update-status \
-        --job-id "$job_id" --status done --exit-code $exit_code 2>/dev/null || true
+    finalize_job "done" "$exit_code"
 else
-    python3 "${script_dir}/gpu_claim.py" update-status \
-        --job-id "$job_id" --status failed --exit-code $exit_code 2>/dev/null || true
+    finalize_job "failed" "$exit_code"
 fi
 
 exit $exit_code
@@ -107,7 +148,7 @@ WAITER_SCRIPT
 chmod +x "$waiter_script"
 
 # Launch the waiter script in background
-nohup bash "$waiter_script" "$job_id" "$script_path" "$log_file" "$pids" "$NUM_GPUS" "$queue_dir" 2>&1 | tee -a "$log_file" > /dev/null 2>&1 &
+nohup bash "$waiter_script" "$job_id" "$script_path" "$log_file" "$pids" "$NUM_GPUS" "$queue_dir" "$hostname" "$slurm_job_id" 2>&1 | tee -a "$log_file" > /dev/null 2>&1 &
 waiter_pid=$!
 
 echo "Job ID: $job_id"

@@ -10,12 +10,14 @@ Usage:
 """
 
 import json
+import os
 import sys
 import argparse
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
 
 STATE_DIR = Path.cwd() / ".gpu_queue"
 JOBS_DIR = STATE_DIR / "jobs"
@@ -42,16 +44,153 @@ def load_claims() -> Dict[int, Tuple[str, int]]:
     if CLAIMS_DIR.exists():
         for claim_dir in CLAIMS_DIR.glob("gpu_*.lock"):
             try:
-                gpu_idx = int(claim_dir.name.split("_")[1])
+                gpu_idx = int(claim_dir.name[len("gpu_") : -len(".lock")])
                 job_id_file = claim_dir / "job_id"
                 pid_file = claim_dir / "pid"
                 if job_id_file.exists() and pid_file.exists():
                     job_id = job_id_file.read_text().strip()
                     pid = int(pid_file.read_text().strip())
-                    claims[gpu_idx] = (job_id, pid)
+                    if pid_is_live(pid):
+                        claims[gpu_idx] = (job_id, pid)
             except Exception:
                 pass
     return claims
+
+
+def pid_is_live(pid: int) -> bool:
+    """Return True when a PID currently exists."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    else:
+        return True
+
+
+def live_gpu_processes() -> Dict[int, List[int]]:
+    """Return dict of gpu_idx -> live compute process PIDs from nvidia-smi."""
+    gpu_pids: Dict[int, List[int]] = {}
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=gpu_uuid,pid",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return gpu_pids
+
+        uuid_to_idx = gpu_uuid_to_index()
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 2:
+                continue
+            gpu_uuid, pid_str = parts
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+            gpu_idx = uuid_to_idx.get(gpu_uuid)
+            if gpu_idx is None or not pid_is_live(pid):
+                continue
+            gpu_pids.setdefault(gpu_idx, []).append(pid)
+    except Exception:
+        return {}
+    return gpu_pids
+
+
+def gpu_uuid_to_index() -> Dict[str, int]:
+    """Return mapping from GPU UUID to index."""
+    mapping: Dict[str, int] = {}
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return mapping
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",", 1)]
+            if len(parts) != 2:
+                continue
+            try:
+                mapping[parts[1]] = int(parts[0])
+            except ValueError:
+                continue
+    except Exception:
+        return {}
+    return mapping
+
+
+def live_job_pids(jobs: Dict[str, Dict]) -> Set[int]:
+    """Return live job launcher PIDs from persisted job metadata."""
+    pids: Set[int] = set()
+    for job in jobs.values():
+        try:
+            pid = int(job.get("pid"))
+        except Exception:
+            continue
+        if pid_is_live(pid):
+            pids.add(pid)
+    return pids
+
+
+@lru_cache(maxsize=128)
+def host_status(hostname: str) -> str:
+    """Return a best-effort hostname existence status."""
+    if not hostname:
+        return "--"
+    current_host = os.uname().nodename
+    if hostname == current_host:
+        return "local"
+    try:
+        result = subprocess.run(
+            ["getent", "hosts", hostname],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return "resolves" if result.returncode == 0 and result.stdout.strip() else "missing"
+    except Exception:
+        return "unknown"
+
+
+@lru_cache(maxsize=256)
+def slurm_status(slurm_job_id: str) -> str:
+    """Return best-effort Slurm allocation status for a job id."""
+    if not slurm_job_id:
+        return "--"
+    try:
+        result = subprocess.run(
+            ["squeue", "-h", "-j", slurm_job_id, "-o", "%T"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0:
+            status = result.stdout.strip()
+            return status if status else "gone"
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 
 def format_time(iso_string: str) -> str:
@@ -78,6 +217,8 @@ def display_jobs(show_all: bool = False, include_done: bool = True):
     """Display job table."""
     jobs = load_jobs()
     claims = load_claims()
+    gpu_processes = live_gpu_processes()
+    live_pids = live_job_pids(jobs)
 
     if not jobs:
         print("No jobs found.")
@@ -96,9 +237,9 @@ def display_jobs(show_all: bool = False, include_done: bool = True):
 
     # Print header
     print(
-        f"{'JOB ID':<12} {'TASK':<25} {'STATUS':<10} {'GPUs':<12} {'QUEUED':<12} {'LOG':<40}"
+        f"{'JOB ID':<12} {'TASK':<25} {'STATUS':<10} {'NODE':<20} {'NODE OK':<9} {'SLURM':<10} {'GPUs':<12} {'QUEUED':<12} {'LOG':<40}"
     )
-    print("-" * 111)
+    print("-" * 153)
 
     # Print rows
     for job_id, job in sorted_jobs:
@@ -108,14 +249,34 @@ def display_jobs(show_all: bool = False, include_done: bool = True):
         log_file = job.get("log_file", "")
 
         # Find GPUs for this job
+        job_pid = job.get("pid")
+        job_pid_live = isinstance(job_pid, int) and job_pid in live_pids
+        node_name = job.get("hostname") or (
+            os.uname().nodename if job_pid_live else "--"
+        )
+        node_ok = host_status(node_name)
+        slurm_state = slurm_status(str(job.get("slurm_job_id", "")))
         gpu_list = sorted([idx for idx, (jid, _) in claims.items() if jid == job_id])
+        if not gpu_list and job_pid_live:
+            gpu_list = sorted(
+                idx for idx, pids in gpu_processes.items() if int(job_pid) in pids
+            )
+        if not gpu_list:
+            claimed = job.get("gpus_claimed", "")
+            try:
+                gpu_list = sorted(
+                    int(part.strip())
+                    for part in claimed.split(",")
+                    if part.strip() != ""
+                )
+            except ValueError:
+                gpu_list = []
         gpu_str = ",".join(str(g) for g in gpu_list) if gpu_list else "--"
-
         # Format log file path (show just the filename)
         log_name = Path(log_file).name if log_file else "--"
 
         print(
-            f"{job_id:<12} {task_name:<25} {status:<10} {gpu_str:<12} {format_time(queued_at):<12} {log_name:<40}"
+            f"{job_id:<12} {task_name:<25} {status:<10} {node_name:<20} {node_ok:<9} {slurm_state:<10} {gpu_str:<12} {format_time(queued_at):<12} {log_name:<40}"
         )
 
     print()
@@ -125,6 +286,8 @@ def display_gpu_status():
     """Display GPU status and claims."""
     claims = load_claims()
     jobs = load_jobs()
+    gpu_processes = live_gpu_processes()
+    live_pids = live_job_pids(jobs)
 
     # Get total GPU count
     try:
@@ -170,6 +333,17 @@ def display_gpu_status():
                 print(
                     f"  GPU {gpu_idx}: CLAIMED by {job_id} ({task_name}) since {format_time(claimed_at)}"
                 )
+            elif gpu_processes.get(gpu_idx):
+                used_pct = (used / total * 100) if total > 0 else 0
+                matching_jobs = []
+                for job_id, job in jobs.items():
+                    job_pid = job.get("pid")
+                    if isinstance(job_pid, int) and job_pid in live_pids and job_pid in gpu_processes[gpu_idx]:
+                        matching_jobs.append(job_id)
+                owner = ",".join(sorted(matching_jobs)) if matching_jobs else "external process"
+                print(
+                    f"  GPU {gpu_idx}: IN USE by {owner} ({used:.0f}/{total:.0f} MiB, {used_pct:.1f}% used)"
+                )
             else:
                 used_pct = (used / total * 100) if total > 0 else 0
                 print(f"  GPU {gpu_idx}: FREE ({used:.0f}/{total:.0f} MiB, {used_pct:.1f}% used)")
@@ -178,13 +352,38 @@ def display_gpu_status():
 
 
 def cmd_clean():
-    """Clean stale claims."""
-    subprocess.run(
-        ["python3", str(SCRIPT_DIR / "gpu_claim.py"), "clean"],
-        cwd=Path.cwd(),
-        capture_output=True,
-    )
-    print("Cleaned stale claims.")
+    """Clean stale claims and dead running job records."""
+    helper = SCRIPT_DIR / "nohup-queue" / "gpu_claim.py"
+    if helper.exists():
+        subprocess.run(
+            ["python3", str(helper), "clean"],
+            cwd=Path.cwd(),
+            capture_output=True,
+        )
+
+    cleaned_jobs = 0
+    jobs = load_jobs()
+    current_host = os.uname().nodename
+    for job_id, job in jobs.items():
+        if job.get("status") != "running":
+            continue
+        job_host = job.get("hostname")
+        if not job_host or job_host != current_host:
+            continue
+        try:
+            pid = int(job.get("pid"))
+        except Exception:
+            pid = -1
+        if pid_is_live(pid):
+            continue
+        job_file = JOBS_DIR / f"{job_id}.json"
+        try:
+            job_file.unlink()
+            cleaned_jobs += 1
+        except FileNotFoundError:
+            pass
+
+    print(f"Cleaned stale claims and removed {cleaned_jobs} dead job records.")
 
 
 def cmd_clear_done():

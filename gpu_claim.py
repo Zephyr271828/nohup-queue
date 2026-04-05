@@ -229,6 +229,9 @@ def update_job_status(
     pid: Optional[int] = None,
     gpus: Optional[str] = None,
     exit_code: Optional[int] = None,
+    hostname: Optional[str] = None,
+    script_path: Optional[str] = None,
+    slurm_job_id: Optional[str] = None,
 ):
     """Update a job's status JSON file."""
     ensure_state_dirs()
@@ -250,6 +253,12 @@ def update_job_status(
         job["gpus_claimed"] = gpus
     if exit_code is not None:
         job["exit_code"] = exit_code
+    if hostname is not None:
+        job["hostname"] = hostname
+    if script_path is not None:
+        job["script_path"] = script_path
+    if slurm_job_id is not None:
+        job["slurm_job_id"] = slurm_job_id
 
     if status == "running" and "started_at" not in job:
         job["started_at"] = datetime.utcnow().isoformat() + "Z"
@@ -318,6 +327,9 @@ def cmd_update_status(args):
         pid=args.pid,
         gpus=args.gpus,
         exit_code=args.exit_code,
+        hostname=args.hostname,
+        script_path=args.script_path,
+        slurm_job_id=args.slurm_job_id,
     )
     return 0
 
@@ -380,6 +392,15 @@ def main():
     status_parser.add_argument("--gpus", type=str, default=None, help="GPU indices")
     status_parser.add_argument(
         "--exit-code", type=int, default=None, help="Exit code"
+    )
+    status_parser.add_argument(
+        "--hostname", type=str, default=None, help="Host running the job"
+    )
+    status_parser.add_argument(
+        "--script-path", type=str, default=None, help="Script launched for the job"
+    )
+    status_parser.add_argument(
+        "--slurm-job-id", type=str, default=None, help="Parent Slurm job allocation id"
     )
     status_parser.set_defaults(func=cmd_update_status)
 
