@@ -28,6 +28,13 @@ job_id="job_$(openssl rand -hex 4)"
 
 mkdir -p "$(pwd)/logs/${task_name}"
 
+# Ensure unique log file path by checking for collisions
+while [[ -f "$log_file" ]]; do
+    sleep 1
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    log_file="$(pwd)/logs/${task_name}/${timestamp}.log"
+done
+
 # Get NUM_GPUS from environment (default 0 = no GPU waiting)
 NUM_GPUS=${NUM_GPUS:-0}
 
@@ -130,6 +137,8 @@ fi
 
 # Run the actual training/eval script
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting: bash $script_path" >> "$log_file"
+export NOHUP_JOB_ID="$job_id"
+export NOHUP_QUEUE_DIR="$script_dir"
 set +e
 bash "$script_path"
 exit_code=$?
