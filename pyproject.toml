@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nohup-queue"
+version = "0.2.0"
+description = "GPU job queue with nohup-style background execution"
+requires-python = ">=3.8"
+
+[project.scripts]
+nohup-queue = "nohup_queue.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nohup_queue*"]

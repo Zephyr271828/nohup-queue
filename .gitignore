@@ -1,0 +1,15 @@
+# State directory (created by nohup_run.sh)
+.gpu_queue/
+
+# Temporary files
+*.tmp
+*.log
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
