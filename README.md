@@ -25,13 +25,15 @@ Use it from a long-lived shell on that node:
 - waits until the requested number of GPUs are free
 - claims those GPUs so other queued jobs do not race with it
 - starts your script with `CUDA_VISIBLE_DEVICES` set
-- tracks job status with `njobs`
+- tracks job status with `nohup-queue jobs`
 
-## Files
+## Commands
 
-- `nohup_run.sh`: submit a job
-- `gpu_claim.py`: claim/release GPUs
-- `njobs`: show queue status
+A single `nohup-queue` entry point with three subcommands:
+
+- `nohup-queue run <script>`: submit a job
+- `nohup-queue jobs`: show queue and GPU status
+- `nohup-queue clean`: remove stale claims and dead job records
 
 ## Basic use
 
@@ -50,9 +52,15 @@ screen -S gpu-queue
 Then submit jobs:
 
 ```bash
-NUM_GPUS=8 ./nohup_run.sh scripts/train_a.sh
-NUM_GPUS=8 ./nohup_run.sh scripts/train_b.sh
-NUM_GPUS=4 ./nohup_run.sh scripts/eval.sh
+nohup-queue run scripts/train_a.sh --num-gpus 8
+nohup-queue run scripts/train_b.sh --num-gpus 8
+nohup-queue run scripts/eval.sh --num-gpus 4
+```
+
+`NUM_GPUS` is also honored as the default for `--num-gpus`:
+
+```bash
+NUM_GPUS=8 nohup-queue run scripts/train.sh
 ```
 
 Each job runs in the background with `nohup`. If the GPUs are not free yet, it waits and starts later.
@@ -60,16 +68,16 @@ Each job runs in the background with `nohup`. If the GPUs are not free yet, it w
 Check status:
 
 ```bash
-./njobs
+nohup-queue jobs
 ```
 
 ## Typical workflow
 
 1. Get onto a GPU node.
 2. Start `tmux` or `screen`.
-3. Queue several jobs with `./nohup_run.sh`.
+3. Queue several jobs with `nohup-queue run`.
 4. Disconnect if you want.
-5. Reconnect later and run `./njobs`.
+5. Reconnect later and run `nohup-queue jobs`.
 
 This is useful when the node is valuable and you want your next job to start immediately after the current one finishes.
 
@@ -78,35 +86,42 @@ This is useful when the node is valuable and you want your next job to start imm
 Run a training job that needs 8 GPUs:
 
 ```bash
-NUM_GPUS=8 ./nohup_run.sh scripts/train.sh
+nohup-queue run scripts/train.sh --num-gpus 8
 ```
 
 Run without GPU waiting:
 
 ```bash
-NUM_GPUS=0 ./nohup_run.sh scripts/eval.sh
+nohup-queue run scripts/eval.sh --num-gpus 0
 ```
 
 Wait for another local process first:
 
 ```bash
-NUM_GPUS=8 ./nohup_run.sh scripts/train.sh --pids 12345
+nohup-queue run scripts/train.sh --num-gpus 8 --pids 12345
 ```
 
-Show all remembered jobs:
+Show all remembered jobs (including done):
 
 ```bash
-./njobs --all
+nohup-queue jobs --all
 ```
 
 Clean stale state:
 
 ```bash
-./njobs --clean
+nohup-queue clean
+```
+
+Also drop done/failed records older than 24h:
+
+```bash
+nohup-queue clean --clear-done
 ```
 
 ## Notes
 
-- Queue state is stored in `.gpu_queue/` in the current working directory.
+- Queue state is stored in `$HOME/.gpu_queue/` by default, or `$NOHUP_QUEUE_CACHE_DIR/.gpu_queue/` if set.
+- Logs default to `./logs/<task_name>/`; override with `--log-dir`.
 - This is meant for one node at a time.
 - Your script should respect `CUDA_VISIBLE_DEVICES` if it is already set.
