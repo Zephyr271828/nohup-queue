@@ -113,8 +113,8 @@ fi
 if [[ $num_gpus -gt 0 ]]; then
     while true; do
         claimed=$(python3 "${script_dir}/gpu_claim.py" claim \
-                  --num-gpus "$num_gpus" --job-id "$job_id" --pid $$ 2>/dev/null)
-        if [[ $? -eq 0 ]]; then
+                  --num-gpus "$num_gpus" --job-id "$job_id" --pid $$ 2>/dev/null) || true
+        if [[ -n "$claimed" ]]; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Claimed GPUs: $claimed" >> "$log_file"
             export CUDA_VISIBLE_DEVICES="$claimed"
             python3 "${script_dir}/gpu_claim.py" update-status \

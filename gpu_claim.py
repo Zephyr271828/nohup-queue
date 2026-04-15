@@ -86,7 +86,7 @@ def get_gpu_list() -> List[Tuple[int, float, bool]]:
             try:
                 # Check if there are any compute processes on this GPU
                 result = subprocess.run(
-                    ["nvidia-smi", "-i", str(idx), "--query-compute-apps=pid"],
+                    ["nvidia-smi", "-i", str(idx), "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
                     capture_output=True,
                     text=True,
                     timeout=10,
@@ -285,7 +285,7 @@ def list_jobs() -> Dict:
     # Load all claims
     for claim_dir in CLAIMS_DIR.glob("gpu_*.lock"):
         try:
-            gpu_idx = int(claim_dir.name.split("_")[1])
+            gpu_idx = int(claim_dir.name[len("gpu_"):-len(".lock")])
             job_id_file = claim_dir / "job_id"
             if job_id_file.exists():
                 job_id = job_id_file.read_text().strip()
@@ -354,7 +354,7 @@ def cmd_clean(args):
             if job["status"] in ("done", "failed"):
                 ended_at = job.get("ended_at")
                 if ended_at:
-                    ended = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                    ended = datetime.fromisoformat(ended_at.replace("Z", "+00:00")).replace(tzinfo=None)
                     if ended < cutoff:
                         job_file.unlink()
         except Exception:

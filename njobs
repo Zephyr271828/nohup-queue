@@ -353,7 +353,7 @@ def display_gpu_status():
 
 def cmd_clean():
     """Clean stale claims and dead running job records."""
-    helper = SCRIPT_DIR / "nohup-queue" / "gpu_claim.py"
+    helper = SCRIPT_DIR / "gpu_claim.py"
     if helper.exists():
         subprocess.run(
             ["python3", str(helper), "clean"],
@@ -396,7 +396,7 @@ def cmd_clear_done():
             ended_at = job.get("ended_at")
             if ended_at:
                 try:
-                    ended = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                    ended = datetime.fromisoformat(ended_at.replace("Z", "+00:00")).replace(tzinfo=None)
                     if ended < cutoff:
                         job_file = JOBS_DIR / f"{job_id}.json"
                         job_file.unlink()
