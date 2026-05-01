@@ -127,21 +127,14 @@ def live_gpu_processes() -> Dict[int, List[int]]:
 
 
 def clean_stale_claims() -> None:
-    """Remove claims where the owner PID is dead or claim is >2h old."""
+    """Remove claims whose owner PID is no longer alive."""
     ensure_state_dirs()
-    cutoff = time.time() - 2 * 3600
     for claim_dir in get_claims_dir().glob("gpu_*.lock"):
         try:
             pid_file = claim_dir / "pid"
-            claimed_at_file = claim_dir / "claimed_at"
             if pid_file.exists():
                 pid = int(pid_file.read_text().strip())
                 if not pid_is_alive(pid):
-                    shutil.rmtree(claim_dir)
-                    continue
-            if claimed_at_file.exists():
-                claimed_at = float(claimed_at_file.read_text().strip())
-                if claimed_at < cutoff:
                     shutil.rmtree(claim_dir)
         except Exception:
             pass
@@ -164,10 +157,10 @@ def claim_gpus(num_gpus: int, job_id: str, pid: int) -> Optional[str]:
 
     available = [
         (idx, mem, idle) for idx, mem, idle in gpus
-        if not (claims_dir / f"gpu_{idx}.lock").exists()
+        if idle and not (claims_dir / f"gpu_{idx}.lock").exists()
     ]
-    # Prefer idle GPUs, then most free memory
-    available.sort(key=lambda x: (not x[2], -x[1]))
+    # Most free memory first
+    available.sort(key=lambda x: -x[1])
 
     claimed_indices: List[int] = []
     for idx, _, _ in available:
